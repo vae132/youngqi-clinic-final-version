@@ -899,6 +899,117 @@ body.dark-mode .dropdown-hint {{
     var filterSpecialAuthors = false; // false：全部结果；true：只显示作者为 "李宗恩" 或 "andy"
 
     /* ---------------- 辅助函数 ---------------- */
+    
+    
+        
+    // 1) 归一化：和你的搜索规则保持一致（NFKC + 繁转简 + 小写）
+    function norm(s='') {{
+      try {{ s = s.normalize('NFKC'); }} catch(e) {{}}
+      s = converterTw2Cn(s);     // 你已有的 OpenCC：繁 -> 简
+      s = s.toLowerCase();
+      return s;
+    }}
+    
+    // 2) 把原文本逐字归一化，同时建立“归一化串索引 -> 原文下标”的映射
+    function buildNormIndexMap(raw) {{
+      const map = [];     // map[normIndex] = originalIndex
+      let normStr = '';
+      for (let i = 0; i < raw.length; i++) {{
+        const ch = raw[i];
+        const n = norm(ch);   // 单字符归一化（保持索引一一对应）
+        normStr += n;
+        for (let k = 0; k < n.length; k++) {{
+          map.push(i);        // 归一化出的每个位置都指回这个原字符
+        }}
+      }}
+      return {{ normStr, map }};
+    }}
+    
+    // 3) 在归一化串里找所有命中区间
+    function findAll(haystack, needle) {{
+      const hits = [];
+      if (!needle) return hits;
+      let i = 0;
+      while ((i = haystack.indexOf(needle, i)) !== -1) {{
+        hits.push([i, i + needle.length]); // 半开区间
+        i += Math.max(needle.length, 1);
+      }}
+      return hits;
+    }}
+    
+// 用归一化索引在“单个文本节点”内高亮，不破坏外层 DOM 结构
+function highlightOneTextNode(node, keyword) {{
+  const raw = node.nodeValue;
+  if (!raw || !keyword) return;
+
+  // 复用你已有的归一化工具
+  const {{ normStr, map }} = buildNormIndexMap(raw);
+  const nk = norm(keyword);
+  const hits = findAll(normStr, nk);
+  if (!hits.length) return;
+
+  // 从后向前处理，避免下标偏移
+  const frag = document.createDocumentFragment();
+  let lastEnd = raw.length;
+
+  for (let i = hits.length - 1; i >= 0; i--) {{
+    const [s, e] = hits[i];
+    const start = map[s];
+    const end   = map[e - 1] + 1;
+
+    if (end < lastEnd) {{
+      frag.prepend(document.createTextNode(raw.slice(end, lastEnd)));
+    }}
+
+    const span = document.createElement('span');
+    span.className = 'keyword-highlight';
+    span.textContent = raw.slice(start, end);
+    frag.prepend(span);
+
+    lastEnd = start;
+  }}
+
+  if (lastEnd > 0) {{
+    frag.prepend(document.createTextNode(raw.slice(0, lastEnd)));
+  }}
+
+  node.replaceWith(frag);
+}}
+
+// 遍历 el 下所有文本节点逐个高亮（不跨标签匹配）
+function highlightNormalized(el, keyword) {{
+  // 先清旧高亮（保持你原先的做法）
+  el.querySelectorAll('span.keyword-highlight').forEach(function(sp) {{
+    const p = sp.parentNode;
+    while (sp.firstChild) p.insertBefore(sp.firstChild, sp);
+    p.removeChild(sp);
+    p.normalize();
+  }});
+  if (!keyword || !keyword.trim()) return;
+
+  const walker = document.createTreeWalker(
+    el,
+    NodeFilter.SHOW_TEXT,
+    {{
+      acceptNode: (n) => {{
+        if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+        const p = n.parentNode;
+        if (!p) return NodeFilter.FILTER_REJECT;
+        const tn = p.nodeName;
+        if (tn === 'SCRIPT' || tn === 'STYLE' || tn === 'NOSCRIPT' || tn === 'IFRAME') {{
+          return NodeFilter.FILTER_REJECT;
+        }}
+        return NodeFilter.FILTER_ACCEPT;
+      }}
+    }}
+  );
+
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  nodes.forEach(textNode => highlightOneTextNode(textNode, keyword));
+}}
+
+    
     function escapeRegExp(s) {{
       // 标准写法：把正则特殊字符全部转义
       return s.replace(/[.*+?^${{}}()|[\\]\\]/g, '\\$&');
@@ -1190,17 +1301,17 @@ if (searchType === 'article') {{
       // 去空白后的无间隔匹配
     var textCN_noWS = normalizeForSearch(textToSearch);
     var kwCN_noWS   = normalizeForSearch(kwRaw);
-    
+
     if (textCN_noWS.indexOf(kwCN_noWS) !== -1) {{
       let foundInHeader = false, foundInContent = false;
-    
+
       // 标题/正文命中位置判断也用去空白版本
       foundInHeader  = !!(articleHeaderElem  &&
         normalizeForSearch(articleHeaderElem.innerText).includes(kwCN_noWS));
-    
+
       foundInContent = !!(articleContentElem &&
         normalizeForSearch(articleContentElem.innerText).includes(kwCN_noWS));
-    
+
       const previewText = articleContentElem ? articleContentElem.innerText.slice(0, 60) + '...' : "";
       const articleTime = article.article_time || "未知时间";
 
@@ -1241,9 +1352,12 @@ if (searchType === 'article') {{
                if (textCN_noWS.indexOf(kwCN_noWS) !== -1) {{
                 const commentTextElem = commentElem.querySelector('.comment-text');
                 if (commentTextElem) {{  
-                const reg = kwRegex;  // 多形态：涵盖 cn/tw/t/hk 四套写法
-                commentTextElem.innerHTML = commentTextElem.innerHTML.replace(reg, '<span class="keyword-highlight">$1</span>');
-                }}
+            if (!commentTextElem.dataset.rawHtml) {{
+                commentTextElem.dataset.rawHtml = commentTextElem.innerHTML;
+              }}
+              // 用“文本节点包装”高亮（kwRaw 是你上面已算好的原始关键词）
+              highlightNormalized(commentTextElem, kwRaw);
+            }}
                 const author = commentElem.querySelector('.author') ? commentElem.querySelector('.author').innerText : "";
                 const timeElem = commentElem.querySelector('.time');
                 const time = timeElem ? timeElem.innerText : "";
@@ -1380,28 +1494,21 @@ if (searchType === 'article') {{
                     window.scrollTo({{ top: offsetPosition, behavior: 'smooth' }});
                   }}
 
-                  // ====== 新增：标题命中 → 先缓存原始 HTML 再高亮 ======
-                // ====== 标题命中 → 先缓存原始 HTML 再高亮 ======
+                // 标题
                 if (result.foundInHeader && articleHeader) {{
                   if (!articleHeader.dataset.rawHtml) {{ articleHeader.dataset.rawHtml = articleHeader.innerHTML; }}
-                  const regH = getKwRegex();
-                  if (regH) {{
-                    articleHeader.innerHTML = articleHeader.innerHTML.replace(regH, '<span class="keyword-highlight">$1</span>');
-                  }}
+                  highlightNormalized(articleHeader, currentSearchKeyword);   // ✅ 改这里
                   articleHeader.classList.add('article-search-highlight');
                   articleHeader.onclick = function() {{ removeArticleHighlight(articleHeader); }};
                 }}
-
-                // ====== 正文命中 → 先缓存原始 HTML 再高亮 ======
-                if (result.foundInContent && articleContent) {{
-                  if (!articleContent.dataset.rawHtml) {{ articleContent.dataset.rawHtml = articleContent.innerHTML; }}
-                  const regC = getKwRegex();
-                  if (regC) {{
-                    articleContent.innerHTML = articleContent.innerHTML.replace(regC, '<span class="keyword-highlight">$1</span>');
-                  }}
-                  articleContent.classList.add('article-search-highlight');
-                  articleContent.onclick = function() {{ removeArticleHighlight(articleContent); }};
-                }}
+            
+            // 正文
+            if (result.foundInContent && articleContent) {{
+              if (!articleContent.dataset.rawHtml) {{ articleContent.dataset.rawHtml = articleContent.innerHTML; }}
+              highlightNormalized(articleContent, currentSearchKeyword);  // ✅ 改这里
+              articleContent.classList.add('article-search-highlight');
+              articleContent.onclick = function() {{ removeArticleHighlight(articleContent); }};
+            }}
 
                 }} else {{
                   // 评论命中：滚动并高亮评论
@@ -1493,18 +1600,17 @@ if (searchType === 'article') {{
 
 function highlightComment(comment) {{
   comment.classList.add('highlighted-comment');
-
   const commentTextElem = comment.querySelector('.comment-text');
   if (!commentTextElem) return;
 
-  // 首次高亮时缓存原始 HTML，方便点击后还原
+  // 首次缓存原始 HTML（保留你已有的还原机制）
   if (!commentTextElem.dataset.rawHtml) {{
     commentTextElem.dataset.rawHtml = commentTextElem.innerHTML;
   }}
 
+  // ✅ 用“归一化映射高亮”，解决菸/烟/煙等字形
   if (currentSearchKeyword) {{
-    const reg = buildHighlightRegex(currentSearchKeyword);  // 多形态高亮
-    commentTextElem.innerHTML = commentTextElem.innerHTML.replace(reg, '<span class="keyword-highlight">$1</span>');
+    highlightNormalized(commentTextElem, currentSearchKeyword);
   }}
 }}
 
